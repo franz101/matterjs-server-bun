@@ -1,53 +1,65 @@
 # Matter Server (matter.js) as a single compiled Bun binary.
-# Builder installs the stock matter-server npm package, bakes the pinned
-# version in (see matter-compile-patch.mjs - compiled binaries resolve
-# import.meta.url to /$bunfs/..., breaking the package.json lookups), and
-# compiles everything to one ~86MB executable. Final stage is plain debian
-# slim + curl/ping - no Node, no Bun runtime, no node_modules.
 #
-# Verified on linux/arm64: WS /ws (server_info/get_nodes/start_listening),
-# /health, clean SIGTERM shutdown. 207MB image (vs 531MB bun+node_modules),
-# ~141MB RSS idle (vs ~226MB uncompiled).
+# The builder installs the published matter-server npm package, bakes the pinned
+# version in (see compile-patch.mjs: compiled binaries resolve import.meta.url to
+# /$bunfs/..., which breaks the package.json lookups), and compiles everything
+# into one executable. The final stage is plain debian slim + curl/ping - no Node,
+# no Bun runtime, no node_modules. See bun/README.md for sizes and trade-offs.
 #
-# Trade-offs vs the uncompiled variant, do NOT just drop these flags:
-# --disable-dashboard (dashboard assets live on disk in node_modules, the
-#   compiled binary can't serve them - HA is the UI anyway)
-# --disable-dcl-seed (offline DCL seed files live on disk too - with this flag
-#   vendors/certs load from network DCL at boot, needs internet)
-# BLE stays disabled (native noble postinstalls skipped); commission via HA app.
-ARG MATTER_SERVER_VERSION=1.4.0
-FROM oven/bun:1-slim AS builder
+# Build from the repository root (the healthcheck script is shared with docker/):
+#   docker build -f bun/Dockerfile -t matter-server-bun .
+
+ARG MATTERJS_SERVER_VERSION=1.4.0
+ARG BUN_VERSION=1
+
+FROM oven/bun:${BUN_VERSION}-slim AS builder
 
 WORKDIR /build
-ARG MATTER_SERVER_VERSION
-COPY compile-patch.mjs ./
-RUN bun add --trust "matter-server@${MATTER_SERVER_VERSION}" \
-    && bun ./compile-patch.mjs "${MATTER_SERVER_VERSION}" \
+ARG MATTERJS_SERVER_VERSION
+COPY bun/compile-patch.mjs ./
+RUN bun add --trust "matter-server@${MATTERJS_SERVER_VERSION}" \
+    && bun ./compile-patch.mjs "${MATTERJS_SERVER_VERSION}" \
     && bun build --compile \
         node_modules/matter-server/dist/esm/MatterServer.js \
-        --outfile ./msrv \
-    && rm -rf node_modules bun.lock package.json compile-patch.mjs \
-    && ls -lh ./msrv
+        --outfile ./matter-server \
+    && ls -lh ./matter-server
 
 FROM debian:trixie-slim
+
+# - iputils-ping: required for node ping functionality
+# - curl: healthcheck
+# - libcap2-bin: provides setcap to grant ping CAP_NET_RAW (purged afterwards)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl iputils-ping \
+    && apt-get install -y --no-install-recommends curl iputils-ping libcap2-bin \
+    # ping_node runs as the non-root user; CAP_NET_RAW on the binary lets it open
+    # an ICMP socket regardless of the host's net.ipv4.ping_group_range.
+    && setcap cap_net_raw+ep "$(command -v ping)" \
+    && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir /data \
     && chown 1000:1000 /data
 
-COPY --from=builder /build/msrv /msrv
+COPY --from=builder /build/matter-server /usr/local/bin/matter-server
+COPY --chmod=0755 docker/matterjs-server/healthcheck.sh /usr/local/bin/healthcheck.sh
 
-ENV STORAGE_PATH=/data
-ENV PORT=5580
 ENV LOG_LEVEL=info
+ENV STORAGE_PATH=/data
+# Required for the compiled binary, do NOT turn these off: the dashboard assets
+# and the offline DCL seed are read from node_modules on disk, which this image
+# does not contain. Set as env (not CMD) so extra CLI args don't drop them.
+# With the seed disabled, vendor/cert data is fetched from the network DCL.
+ENV DISABLE_DASHBOARD=true
+ENV DISABLE_DCL_SEED=true
 
 VOLUME ["/data"]
 
 EXPOSE 5580
 
-HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --start-interval=5s --retries=6 \
-    CMD curl -fsS -o /dev/null -m 5 "http://localhost:${PORT:-5580}/health" || exit 1
+# Healthcheck script honours LISTEN_ADDRESS / PORT so it still works when the
+# server is bound to a non-localhost address. See script for limitations.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=900s --start-interval=5s --retries=6 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
 
-ENTRYPOINT ["/msrv"]
-CMD ["--disable-dashboard", "--disable-dcl-seed"]
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/matter-server"]
+CMD []

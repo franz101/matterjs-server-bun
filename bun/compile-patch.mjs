@@ -4,21 +4,30 @@ import { readFileSync, writeFileSync } from "node:fs";
 // so matter-server's package.json lookups (cli.ts, version.ts) escape to the
 // real fs root and crash. Bake the pinned version in instead.
 // Fails loudly if upstream restructures (check the new code, adjust, re-pin).
-const [ver] = process.argv.slice(2);
-if (!ver) throw new Error("usage: matter-compile-patch.mjs <version>");
+const [version] = process.argv.slice(2);
+if (!version) throw new Error("usage: bun compile-patch.mjs <version>");
 
-const vjs = "node_modules/matter-server/dist/esm/version.js";
-let s = readFileSync(vjs, "utf8");
-const vAnchor = "const MATTER_SERVER_VERSION = getMatterServerVersion();";
-if (!s.includes(vAnchor)) throw new Error("version.js pattern gone - check upstream");
-s = s.replace(vAnchor, `const MATTER_SERVER_VERSION = ${JSON.stringify(ver)};`);
-writeFileSync(vjs, s);
+const distDir = "node_modules/matter-server/dist/esm";
 
-const cjs = "node_modules/matter-server/dist/esm/cli.js";
-let c = readFileSync(cjs, "utf8");
-const cAnchor = 'const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));';
-if (!c.includes(cAnchor)) throw new Error("cli.js pattern gone - check upstream");
-c = c.replace(cAnchor, `const packageJson = { version: ${JSON.stringify(ver)} };`);
-writeFileSync(cjs, c);
+function patch(file, anchor, replacement) {
+    const path = `${distDir}/${file}`;
+    const source = readFileSync(path, "utf8");
+    const count = source.split(anchor).length - 1;
+    if (count !== 1) {
+        throw new Error(`${path}: expected exactly one "${anchor}", found ${count} - check upstream`);
+    }
+    writeFileSync(path, source.replace(anchor, replacement));
+}
 
-console.log(`patched to ${ver}`);
+patch(
+    "version.js",
+    "const MATTER_SERVER_VERSION = getMatterServerVersion();",
+    `const MATTER_SERVER_VERSION = ${JSON.stringify(version)};`,
+);
+patch(
+    "cli.js",
+    'const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));',
+    `const packageJson = { version: ${JSON.stringify(version)} };`,
+);
+
+console.log(`patched matter-server to ${version}`);
